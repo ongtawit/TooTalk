@@ -3,4 +3,5 @@ libretranslate
 socketio
 flask
 pyaudio
-flask-socketio
+flask_socketio
+websocket-client

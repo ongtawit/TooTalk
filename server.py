@@ -1,27 +1,22 @@
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from MainTranslate import translate_text
+from datetime import datetime
 import logging
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    logger=True,
+    engineio_logger=True,
+    async_mode='threading'
+)
 
-# In-memory user storage (replace with database in production)
+# User storage
 users = {}
 connections = {}
-
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.json
-    user_id = data.get('user_id')
-    language = data.get('language')
-    
-    if not user_id or not language:
-        return jsonify({'error': 'Missing user_id or language'}), 400
-    
-    users[user_id] = {'language': language, 'status': 'online'}
-    return jsonify({'status': 'success'})
 
 @socketio.on('connect')
 def handle_connect():
@@ -34,12 +29,15 @@ def handle_disconnect():
         del connections[user_id]
         print(f"User disconnected: {user_id}")
 
-@socketio.on('register_socket')
-def register_socket(data):
+@socketio.on('register')
+def handle_register(data):
     user_id = data.get('user_id')
-    if user_id in users:
+    language = data.get('language')
+    if user_id and language:
+        users[user_id] = {'language': language, 'status': 'online'}
         connections[user_id] = request.sid
-        print(f"User {user_id} registered with socket ID {request.sid}")
+        print(f"User {user_id} registered (SID: {request.sid})")
+        emit('registration_success', {'status': 'registered'})
 
 @socketio.on('send_message')
 def handle_message(data):
@@ -52,20 +50,16 @@ def handle_message(data):
         return
     
     if recipient_id not in users:
-        emit('error', {'message': 'Recipient not found'})
+        emit('error', {'message': 'Recipient not found'}, room=connections.get(sender_id))
         return
     
-    # Get recipient's preferred language
     target_language = users[recipient_id]['language']
-    
-    # Translate message
     translated_text, detected_language = translate_text(message, target_language)
     
     if not translated_text:
-        emit('error', {'message': 'Translation failed'})
+        emit('error', {'message': 'Translation failed'}, room=connections.get(sender_id))
         return
     
-    # Prepare message data
     message_data = {
         'from': sender_id,
         'original_message': message,
@@ -75,14 +69,12 @@ def handle_message(data):
         'timestamp': datetime.now().isoformat()
     }
     
-    # Send to recipient
     if recipient_id in connections:
         emit('receive_message', message_data, room=connections[recipient_id])
     
-    # Send confirmation to sender
     emit('message_sent', {'status': 'success'}, room=connections[sender_id])
 
-# VOIP signaling handlers
+# VOIP handlers
 @socketio.on('offer')
 def handle_offer(data):
     recipient_id = data.get('to')
@@ -102,4 +94,10 @@ def handle_ice_candidate(data):
         emit('ice_candidate', data, room=connections[recipient_id])
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=5001,
+        debug=True,
+        allow_unsafe_werkzeug=True
+    )
