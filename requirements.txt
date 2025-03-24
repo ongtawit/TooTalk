@@ -1,2 +1,6 @@
 requests
 libretranslate
+socketio
+flask
+pyaudio
+flask-socketio
