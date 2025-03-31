@@ -126,7 +126,8 @@ class ChatClient:
             'sender_id': self.user_id,
             'recipient_id': recipient_id,
             'message': message
-        }, callback=lambda ack: print("Message delivered" if ack else "Delivery failed"))
+        })
+        print("Message sent")
         
     def start_call(self, recipient_id):
         print(f"Calling {recipient_id}...")

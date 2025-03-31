@@ -1,10 +1,15 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import socketio
-from MainTranslate import SUPPORTED_LANGUAGES
+from MainTranslate import SUPPORTED_LANGUAGES, translate_text
 import threading
 import pyaudio
 from datetime import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Audio configuration for VOIP
 CHUNK = 1024
@@ -25,8 +30,8 @@ class TooTalkGUI:
         self.recipient = None
         self.audio_stream = None
         self.audio_running = False
-        self.contacts = {}
         self.active_chats = {}
+        self.server_url = ""
         
         # Initialize PyAudio
         self.p = pyaudio.PyAudio()
@@ -35,10 +40,26 @@ class TooTalkGUI:
         self.sio = socketio.Client(
             reconnection=True,
             reconnection_attempts=5,
-            reconnection_delay=1
+            reconnection_delay=1,
+            logger=True,
+            engineio_logger=True
         )
         
         # Setup event handlers
+        self.setup_event_handlers()
+        
+        # Create GUI elements
+        self.create_login_frame()
+        self.create_main_frame()
+        
+        # Start with login screen
+        self.show_login()
+        
+        # Configure text tags for message display
+        self.configure_text_tags()
+    
+    def setup_event_handlers(self):
+        """Setup all Socket.IO event handlers"""
         self.sio.on('connect', self.on_connect)
         self.sio.on('disconnect', self.on_disconnect)
         self.sio.on('receive_message', self.on_message)
@@ -47,13 +68,21 @@ class TooTalkGUI:
         self.sio.on('ice_candidate', self.handle_ice_candidate)
         self.sio.on('registration_success', self.on_registration_success)
         self.sio.on('connect_error', self.on_connect_error)
-        
-        # Create GUI elements
-        self.create_login_frame()
-        self.create_main_frame()
-        
-        # Start with login screen
-        self.show_login()
+        self.sio.on('message_sent', self.on_message_sent)
+        self.sio.on('error', self.on_error)
+        self.sio.on('user_status_update', self.on_user_status_update)
+    
+    def configure_text_tags(self):
+        """Configure text tags for the messages display"""
+        if not hasattr(self, 'messages_text'):
+            return
+            
+        self.messages_text.tag_config('sender', foreground='blue', font=('Helvetica', 10, 'bold'))
+        self.messages_text.tag_config('message', font=('Helvetica', 10))
+        self.messages_text.tag_config('translation_label', foreground='green', font=('Helvetica', 9, 'italic'))
+        self.messages_text.tag_config('translation', font=('Helvetica', 10), foreground='#555555')
+        self.messages_text.tag_config('error', foreground='red', font=('Helvetica', 10))
+        self.messages_text.tag_config('system', foreground='gray', font=('Helvetica', 9, 'italic'))
     
     def create_login_frame(self):
         """Create the login/registration frame"""
@@ -66,11 +95,11 @@ class TooTalkGUI:
         self.server_url_entry.grid(row=1, column=1, pady=5)
         self.server_url_entry.insert(0, "http://localhost:5001")
         
-        ttk.Label(self.login_frame, text="User ID:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.login_frame, text="Your User ID:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.user_id_entry = ttk.Entry(self.login_frame, width=30)
         self.user_id_entry.grid(row=2, column=1, pady=5)
         
-        ttk.Label(self.login_frame, text="Language:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.login_frame, text="Your Language:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.language_combobox = ttk.Combobox(self.login_frame, values=list(SUPPORTED_LANGUAGES.values()), state="readonly")
         self.language_combobox.grid(row=3, column=1, pady=5)
         self.language_combobox.current(0)  # Default to English
@@ -85,22 +114,35 @@ class TooTalkGUI:
         """Create the main messenger interface"""
         self.main_frame = ttk.Frame(self.root)
         
-        # Left sidebar - Contacts
-        self.contacts_frame = ttk.Frame(self.main_frame, width=200, style='Sidebar.TFrame')
-        self.contacts_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        self.contacts_frame.pack_propagate(False)
+        # Left sidebar - Recipient Selection
+        self.recipient_frame = ttk.Frame(self.main_frame, width=200)
+        self.recipient_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        self.recipient_frame.pack_propagate(False)
         
-        ttk.Label(self.contacts_frame, text="Contacts", style='Sidebar.TLabel').pack(pady=10)
+        ttk.Label(self.recipient_frame, text="Start Chat With", font=('Helvetica', 12, 'bold')).pack(pady=10)
         
-        self.contacts_tree = ttk.Treeview(self.contacts_frame, height=20, selectmode='browse')
-        self.contacts_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.contacts_tree['columns'] = ('status')
-        self.contacts_tree.column('#0', width=120, anchor=tk.W)
-        self.contacts_tree.column('status', width=50, anchor=tk.CENTER)
-        self.contacts_tree.heading('#0', text='User ID')
-        self.contacts_tree.heading('status', text='Status')
+        # Recipient ID Entry
+        ttk.Label(self.recipient_frame, text="Recipient ID:").pack(pady=5)
+        self.recipient_entry = ttk.Entry(self.recipient_frame)
+        self.recipient_entry.pack(fill=tk.X, padx=5, pady=5)
         
-        self.contacts_tree.bind('<<TreeviewSelect>>', self.on_contact_select)
+        # Start Chat Button
+        self.start_chat_button = ttk.Button(
+            self.recipient_frame, 
+            text="Start Chat", 
+            command=self.set_recipient,
+            state=tk.DISABLED
+        )
+        self.start_chat_button.pack(pady=10)
+        
+        # Call Button (in recipient frame)
+        self.call_button = ttk.Button(
+            self.recipient_frame,
+            text="Call",
+            command=self.start_call,
+            state=tk.DISABLED
+        )
+        self.call_button.pack(pady=5)
         
         # Right side - Chat area
         self.chat_frame = ttk.Frame(self.main_frame)
@@ -110,11 +152,8 @@ class TooTalkGUI:
         self.chat_header = ttk.Frame(self.chat_frame, height=50)
         self.chat_header.pack(fill=tk.X, pady=5)
         
-        self.current_chat_label = ttk.Label(self.chat_header, text="Select a contact to chat", font=('Helvetica', 12, 'bold'))
+        self.current_chat_label = ttk.Label(self.chat_header, text="Enter recipient ID to start chatting", font=('Helvetica', 12, 'bold'))
         self.current_chat_label.pack(side=tk.LEFT, padx=10)
-        
-        self.call_button = ttk.Button(self.chat_header, text="Call", command=self.start_call, state=tk.DISABLED)
-        self.call_button.pack(side=tk.RIGHT, padx=10)
         
         # Chat messages display
         self.messages_frame = ttk.Frame(self.chat_frame)
@@ -147,6 +186,22 @@ class TooTalkGUI:
             state=tk.DISABLED
         )
         self.send_button.pack(side=tk.RIGHT, padx=5, pady=5)
+        
+        # Bind Enter key to send message (with Shift+Enter for new line)
+        self.message_entry.bind('<Return>', self.on_enter_pressed)
+        self.message_entry.bind('<Shift-Return>', self.on_shift_enter_pressed)
+        
+        # Configure text tags
+        self.configure_text_tags()
+    
+    def on_enter_pressed(self, event):
+        """Handle Enter key press for sending messages"""
+        self.send_message()
+        return 'break'  # Prevent default behavior
+    
+    def on_shift_enter_pressed(self, event):
+        """Allow new lines with Shift+Enter"""
+        return  # Allow default behavior (new line)
     
     def show_login(self):
         """Show the login screen"""
@@ -157,14 +212,15 @@ class TooTalkGUI:
         """Show the main messenger interface"""
         self.login_frame.pack_forget()
         self.main_frame.pack(fill=tk.BOTH, expand=True)
+        self.start_chat_button.config(state=tk.NORMAL)
     
     def connect_to_server(self):
         """Connect to the server with provided credentials"""
-        server_url = self.server_url_entry.get()
-        user_id = self.user_id_entry.get()
-        language_name = self.language_combobox.get()
+        self.server_url = self.server_url_entry.get().strip()
+        user_id = self.user_id_entry.get().strip()
+        language_name = self.language_combobox.get().strip()
         
-        if not server_url or not user_id or not language_name:
+        if not self.server_url or not user_id or not language_name:
             self.status_label.config(text="Please fill all fields")
             return
         
@@ -180,12 +236,14 @@ class TooTalkGUI:
             return
         
         self.status_label.config(text="Connecting...")
+        self.login_button.config(state=tk.DISABLED)
         
         # Try to connect in a separate thread to avoid freezing the GUI
         def connect_thread():
             try:
+                logger.info(f"Connecting to server at {self.server_url}")
                 self.sio.connect(
-                    server_url,
+                    self.server_url,
                     transports=['websocket'],
                     namespaces=['/'],
                     socketio_path='/socket.io'
@@ -203,37 +261,67 @@ class TooTalkGUI:
                 self.root.after(0, self.show_main)
                 
             except Exception as e:
+                logger.error(f"Connection error: {str(e)}")
                 self.root.after(0, lambda: self.status_label.config(text=f"Connection error: {str(e)}"))
+                self.root.after(0, lambda: self.login_button.config(state=tk.NORMAL))
         
         threading.Thread(target=connect_thread, daemon=True).start()
     
+    def set_recipient(self):
+        """Set the recipient for the chat"""
+        recipient_id = self.recipient_entry.get().strip()
+        if not recipient_id:
+            messagebox.showerror("Error", "Please enter a recipient ID")
+            return
+        
+        if recipient_id == self.user_id:
+            messagebox.showerror("Error", "You cannot chat with yourself")
+            return
+        
+        self.recipient = recipient_id
+        self.update_chat_display()
+        self.call_button.config(state=tk.NORMAL)
+        self.send_button.config(state=tk.NORMAL)
+        self.current_chat_label.config(text=f"Chat with {self.recipient}")
+        self.display_system_message(f"Started chat with {self.recipient}")
+    
     def on_connect(self):
         """Socket.IO connect event handler"""
-        print("Connected to server")
+        logger.info("Connected to server")
+        self.root.after(0, lambda: self.status_label.config(text="Connected to server"))
     
     def on_disconnect(self):
         """Socket.IO disconnect event handler"""
-        print("Disconnected from server")
+        logger.info("Disconnected from server")
         self.root.after(0, self.show_login)
+        self.root.after(0, lambda: self.status_label.config(text="Disconnected from server"))
     
     def on_connect_error(self, data):
         """Socket.IO connect error handler"""
-        print("Connection failed:", data)
+        logger.error(f"Connection failed: {str(data)}")
         self.root.after(0, lambda: self.status_label.config(text=f"Connection failed: {str(data)}"))
+        self.root.after(0, lambda: self.login_button.config(state=tk.NORMAL))
     
     def on_registration_success(self, data):
         """Registration success handler"""
-        print("Registration confirmed")
+        logger.info("Registration confirmed")
         self.root.after(0, lambda: self.status_label.config(text="Registration successful!"))
+        self.root.after(0, lambda: self.login_button.config(state=tk.NORMAL))
     
-    def on_contact_select(self, event):
-        """Handle contact selection from the treeview"""
-        selected = self.contacts_tree.selection()
-        if selected:
-            self.recipient = self.contacts_tree.item(selected[0], 'text')
-            self.update_chat_display()
-            self.call_button.config(state=tk.NORMAL)
-            self.send_button.config(state=tk.NORMAL)
+    def on_message_sent(self, data):
+        """Handle message sent acknowledgment"""
+        logger.info("Message sent successfully")
+    
+    def on_error(self, data):
+        """Handle error messages from server"""
+        error_msg = data.get('message', 'Unknown error')
+        logger.error(f"Server error: {error_msg}")
+        self.root.after(0, lambda: self.display_system_message(f"Error: {error_msg}"))
+    
+    def on_user_status_update(self, data):
+        """Handle user status updates"""
+        # Could be used to show if recipient is online/offline
+        pass
     
     def update_chat_display(self):
         """Update the chat display for the current recipient"""
@@ -248,7 +336,7 @@ class TooTalkGUI:
                 for msg in self.active_chats[self.recipient]:
                     self.display_message(msg)
         else:
-            self.current_chat_label.config(text="Select a contact to chat")
+            self.current_chat_label.config(text="Enter recipient ID to start chatting")
         
         self.messages_text.config(state='disabled')
         self.messages_text.yview(tk.END)
@@ -272,9 +360,17 @@ class TooTalkGUI:
         self.messages_text.config(state='disabled')
         self.messages_text.yview(tk.END)
     
+    def display_system_message(self, message):
+        """Display a system message in the chat window"""
+        timestamp = datetime.now().strftime("%H:%M")
+        self.messages_text.config(state='normal')
+        self.messages_text.insert(tk.END, f"[{timestamp}] System: {message}\n", 'system')
+        self.messages_text.config(state='disabled')
+        self.messages_text.yview(tk.END)
+    
     def on_message(self, data):
         """Handle incoming messages"""
-        print("Received message:", data)
+        logger.info(f"Received message from {data['from']}")
         
         # Add to active chats
         sender = data['from']
@@ -285,6 +381,9 @@ class TooTalkGUI:
         # Update UI if this is the current chat
         if self.recipient == sender:
             self.root.after(0, self.display_message, data)
+        else:
+            # Notify user of new message from another contact
+            self.root.after(0, lambda: self.display_system_message(f"New message from {sender}"))
     
     def send_message(self):
         """Send a message to the current recipient"""
@@ -333,14 +432,14 @@ class TooTalkGUI:
     
     def handle_offer(self, data):
         """Handle incoming call offer"""
-        print("Incoming call from", data['from'])
+        logger.info(f"Incoming call from {data['from']}")
         
         # Show call dialog
         self.root.after(0, self.show_call_dialog, data['from'], False)
     
     def handle_answer(self, data):
         """Handle call answer from recipient"""
-        print("Call answered by recipient")
+        logger.info(f"Call answered by {data['from']}")
         self.start_audio_stream()
     
     def handle_ice_candidate(self, data):
@@ -349,23 +448,27 @@ class TooTalkGUI:
     
     def show_call_dialog(self, caller=None, initiator=False):
         """Show call dialog (accept/decline or ongoing call)"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Voice Call")
-        dialog.geometry("300x200")
+        if hasattr(self, 'call_dialog') and self.call_dialog.winfo_exists():
+            return
+            
+        self.call_dialog = tk.Toplevel(self.root)
+        self.call_dialog.title("Voice Call")
+        self.call_dialog.geometry("300x200")
+        self.call_dialog.protocol("WM_DELETE_WINDOW", lambda: self.end_call(self.call_dialog))
         
         if initiator:
-            ttk.Label(dialog, text=f"Calling {self.recipient}...").pack(pady=20)
+            ttk.Label(self.call_dialog, text=f"Calling {self.recipient}...", font=('Helvetica', 12)).pack(pady=20)
         else:
-            ttk.Label(dialog, text=f"Incoming call from {caller}").pack(pady=20)
+            ttk.Label(self.call_dialog, text=f"Incoming call from {caller}", font=('Helvetica', 12)).pack(pady=20)
         
-        button_frame = ttk.Frame(dialog)
+        button_frame = ttk.Frame(self.call_dialog)
         button_frame.pack(pady=20)
         
         if not initiator:
-            ttk.Button(button_frame, text="Accept", command=lambda: self.accept_call(dialog, caller)).pack(side=tk.LEFT, padx=10)
-            ttk.Button(button_frame, text="Decline", command=dialog.destroy).pack(side=tk.LEFT, padx=10)
+            ttk.Button(button_frame, text="Accept", command=lambda: self.accept_call(self.call_dialog, caller)).pack(side=tk.LEFT, padx=10)
+            ttk.Button(button_frame, text="Decline", command=lambda: self.end_call(self.call_dialog)).pack(side=tk.LEFT, padx=10)
         else:
-            ttk.Button(button_frame, text="End Call", command=lambda: self.end_call(dialog)).pack(pady=10)
+            ttk.Button(button_frame, text="End Call", command=lambda: self.end_call(self.call_dialog)).pack(pady=10)
     
     def accept_call(self, dialog, caller):
         """Accept an incoming call"""
@@ -383,7 +486,7 @@ class TooTalkGUI:
         self.stop_audio_stream()
         if dialog:
             dialog.destroy()
-        print("Call ended")
+        logger.info("Call ended")
     
     def start_audio_stream(self):
         """Start audio streaming (simulated)"""
@@ -391,15 +494,19 @@ class TooTalkGUI:
             return
             
         self.audio_running = True
-        self.audio_stream = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            output=True,
-            frames_per_buffer=CHUNK
-        )
-        print("Audio streaming started (simulated)")
+        try:
+            self.audio_stream = self.p.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                output=True,
+                frames_per_buffer=CHUNK
+            )
+            logger.info("Audio streaming started (simulated)")
+        except Exception as e:
+            logger.error(f"Failed to start audio stream: {str(e)}")
+            self.audio_running = False
     
     def stop_audio_stream(self):
         """Stop audio streaming"""
@@ -408,46 +515,28 @@ class TooTalkGUI:
             
         self.audio_running = False
         if self.audio_stream:
-            self.audio_stream.stop_stream()
-            self.audio_stream.close()
-        print("Audio streaming stopped")
+            try:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+                logger.info("Audio streaming stopped")
+            except Exception as e:
+                logger.error(f"Error stopping audio stream: {str(e)}")
     
-    def add_contact(self, user_id, status='online'):
-        """Add a contact to the contact list"""
-        if user_id not in self.contacts:
-            self.contacts[user_id] = status
-            self.contacts_tree.insert('', 'end', text=user_id, values=(status,))
-    
-    def update_contact_status(self, user_id, status):
-        """Update contact status in the contact list"""
-        if user_id in self.contacts:
-            self.contacts[user_id] = status
-            for child in self.contacts_tree.get_children():
-                if self.contacts_tree.item(child, 'text') == user_id:
-                    self.contacts_tree.item(child, values=(status,))
-                    break
+    def __del__(self):
+        """Cleanup resources"""
+        self.stop_audio_stream()
+        if hasattr(self, 'sio') and self.sio.connected:
+            self.sio.disconnect()
+        if hasattr(self, 'p'):
+            self.p.terminate()
 
 if __name__ == "__main__":
     root = tk.Tk()
     
     # Configure styles
     style = ttk.Style()
-    style.configure('Sidebar.TFrame', background='#f0f0f0')
-    style.configure('Sidebar.TLabel', background='#f0f0f0', font=('Helvetica', 10, 'bold'))
-    
-    # Configure text tags for message display
-    text_tags = {
-        'sender': {'foreground': 'blue', 'font': ('Helvetica', 10, 'bold')},
-        'message': {'font': ('Helvetica', 10)},
-        'translation_label': {'foreground': 'green', 'font': ('Helvetica', 9, 'italic')},
-        'translation': {'font': ('Helvetica', 10), 'foreground': '#555555'}
-    }
+    style.configure('TFrame', background='white')
+    style.configure('TLabel', background='white')
     
     app = TooTalkGUI(root)
-    
-    # Add some sample contacts for demonstration
-    app.add_contact("user1", "online")
-    app.add_contact("user2", "away")
-    app.add_contact("user3", "offline")
-    
     root.mainloop()
